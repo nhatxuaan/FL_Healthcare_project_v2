@@ -39,7 +39,7 @@ NUM_ROUNDS = 10  # Number of federated learning rounds
 TAU_STATIC = 0.10  # Divergence threshold per paper
 
 # Non-IID distribution
-DIRICHLET_ALPHA = 0.5  # Non-IID heterogeneity parameter
+DIRICHLET_ALPHA = 1000.0  # Non-IID heterogeneity parameter
 
 # Number of clients
 NUM_CLIENTS_BASELINE = 10  # Paper baseline
