@@ -150,7 +150,7 @@ if __name__ == "__main__":
         np.arange(num_samples),
         labels,
         num_clients=num_clients,
-        alpha=0.5,
+        alpha=100,
         seed=42,
     )
     
