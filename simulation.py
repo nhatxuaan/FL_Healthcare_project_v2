@@ -35,6 +35,7 @@ from src.models import get_model
 from src.client import FlowerClient
 from src.strategy import AdaptiveAggregationStrategy
 from src.evaluation import MetricsLogger, evaluate_model, print_metrics_summary, evaluate_model_detailed
+from src.balancing import balance_client_dataset  # Thêm dòng này để gọi SMOTE
 
 
 # Configure logging
