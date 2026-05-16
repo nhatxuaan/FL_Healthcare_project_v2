@@ -34,7 +34,8 @@ from src.partition import dirichlet_partition
 from src.models import get_model
 from src.client import FlowerClient
 from src.strategy import AdaptiveAggregationStrategy
-from src.evaluation import MetricsLogger, evaluate_model, print_metrics_summary
+from src.evaluation import MetricsLogger, evaluate_model, print_metrics_summary, evaluate_model_detailed
+
 
 # Configure logging
 logging.basicConfig(
