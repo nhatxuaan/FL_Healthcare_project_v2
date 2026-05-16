@@ -334,8 +334,8 @@ def run_simulation(
     final_model.load_state_dict(corrected_state_dict, strict=False)
     final_model = final_model.to(config.DEVICE)
     
-    # Gọi hàm evaluate_model nhận về 3 tham số để lấy detailed_metrics
-    test_loss, test_accuracy, detailed_metrics = evaluate_model(
+    # SỬ DỤNG HÀM DETAILED RIÊNG BIỆT Ở ĐÂY ĐỂ TRÁNH LÀM LỖI VÒNG TRAIN GỐC
+    test_loss, test_accuracy, report_text = evaluate_model_detailed(
         model=final_model,
         dataloader=test_loader,
         device=config.DEVICE,
@@ -372,7 +372,6 @@ def run_simulation(
     
     metrics_logger.save_to_csv()
     
-    # Đóng gói test kết quả bao gồm cả report_text để lưu vào test_results.txt
     test_results = {
         "Test Loss": test_loss,
         "Test Accuracy": test_accuracy,
@@ -380,7 +379,7 @@ def run_simulation(
         "Clients": num_clients,
         "Rounds": num_rounds,
         "DP Enabled": dp_enabled,
-        "report_text": detailed_metrics["report_text"] # Thêm chuỗi văn bản phân tích lớp
+        "report_text": report_text
     }
     metrics_logger.log_test_results(test_results)
     
@@ -392,7 +391,7 @@ def run_simulation(
             "Training Rounds": num_rounds,
             "Clients": num_clients,
             "DP Enabled": dp_enabled,
-            "report_text": detailed_metrics["report_text"]
+            "report_text": report_text
         },
         title="SIMULATION COMPLETE - FINAL METRICS"
     )
@@ -439,10 +438,8 @@ if __name__ == "__main__":
     )
     
     args = parser.parse_args()
-    # DP is enabled by config default, unless --no-dp is specified
     dp_enabled = config.DP_ENABLED and not args.no_dp
     
-    # Run simulation
     history, test_loss, test_acc = run_simulation(
         num_clients=args.num_clients,
         num_rounds=args.num_rounds,
