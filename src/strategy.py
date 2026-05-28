@@ -18,7 +18,7 @@ logger = logging.getLogger(__name__)
 import sys
 sys.path.insert(0, str(Path(__file__).parent.parent))
 import config
-from src.aggregators import aggregate_adaptive, compute_divergence
+from src.aggregators import aggregate_adaptive, compute_cosine_divergence
 
 
 class AdaptiveAggregationStrategy(Strategy):
@@ -139,8 +139,8 @@ class AdaptiveAggregationStrategy(Strategy):
             # Initialize with first client params
             self.global_params = client_weights[0]
         
-        # Compute divergence
-        divergence = compute_divergence(client_weights, self.global_params)
+        # compute_cosine_divergence
+        divergence =compute_cosine_divergence(client_weights, self.global_params)
         self.divergence_history.append(divergence)
         
         # Aggregate with adaptive strategy
