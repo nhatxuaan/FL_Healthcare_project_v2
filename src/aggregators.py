@@ -1,138 +1,23 @@
-"""
-Phase C4: Aggregation Functions
-FedAvg (parameter averaging) and FedSGD (gradient-based) with divergence metric.
-"""
-
-from typing import List, Tuple, Callable
+from typing import List, Tuple
 import numpy as np
-import torch
 import logging
 
 logger = logging.getLogger(__name__)
 
-import sys
-from pathlib import Path
-sys.path.insert(0, str(Path(__file__).parent.parent))
+def flatten_weights(params: List[np.ndarray]) -> np.ndarray:
+    """Duỗi thẳng toàn bộ các tầng trọng số thành 1 vector duy nhất để tính toán toán học."""
+    return np.concatenate([p.flatten() for p in params])
 
-
-def compute_divergence(
-    client_params_list: List[np.ndarray],
-    global_params: np.ndarray,
-) -> float:
-    """
-    Compute divergence metric δ_t between client models and global model.
-    Per paper: δ_t = (1/K) * sum(||w_t^k - w_{t-1}||_2)
+def compute_cosine_divergence(g_i: np.ndarray, g_j: np.ndarray) -> float:
+    """Tính toán Công thức (8): Divergence dựa trên Cosine Similarity."""
+    norm_i = np.linalg.norm(g_i)
+    norm_j = np.linalg.norm(g_j)
     
-    This is the average Euclidean distance between each client's weights and the global weights.
-    
-    Args:
-        client_params_list: List of K client parameter lists (each from get_parameters())
-        global_params: Current global model parameters
-    
-    Returns:
-        Divergence metric (float)
-    """
-    if not client_params_list:
-        logger.warning("compute_divergence: empty client_params_list")
-        return 0.0
-    
-    num_clients = len(client_params_list)
-    total_distance = 0.0
-    
-    for client_params in client_params_list:
-        # Compute Euclidean distance between client and global weights
-        distance = 0.0
-        for client_param, global_param in zip(client_params, global_params):
-            # Flatten to 1D and compute L2 norm
-            diff = (client_param - global_param).flatten()
-            distance += np.sum(diff ** 2)
+    if norm_i == 0 or norm_j == 0:
+        return 1.0  # Tránh lỗi chia cho 0, nếu gradient bằng 0 coi như phân kì hoàn toàn
         
-        distance = np.sqrt(distance)
-        total_distance += distance
-    
-    divergence = total_distance / num_clients
-    return divergence
-
-
-def aggregete_fedavg(
-    client_params_list: List[List[np.ndarray]],
-    client_sample_counts: List[int],
-) -> List[np.ndarray]:
-    """
-    FedAvg aggregation: weighted average of client parameters.
-    
-    Args:
-        client_params_list: List of parameter lists from K clients
-        client_sample_counts: Number of local samples each client trained on
-    
-    Returns:
-        Aggregated global parameters
-    """
-    if not client_params_list:
-        raise ValueError("No clients to aggregate")
-    
-    num_clients = len(client_params_list)
-    total_samples = sum(client_sample_counts)
-    
-    # Weighted average
-    aggregated = None
-    for client_idx, client_params in enumerate(client_params_list):
-        weight = client_sample_counts[client_idx] / total_samples
-        
-        if aggregated is None:
-            aggregated = [param * weight for param in client_params]
-        else:
-            for i, param in enumerate(client_params):
-                aggregated[i] += param * weight
-    
-    logger.debug(f"FedAvg: aggregated {num_clients} clients, total_samples={total_samples}")
-    return aggregated
-
-
-def aggregate_fedsgd(
-    client_params_list: List[List[np.ndarray]],
-    global_params: List[np.ndarray],
-    learning_rate: float,
-    client_sample_counts: List[int],
-) -> List[np.ndarray]:
-    """
-        FedSGD aggregation: server-side gradient-style update from client deltas.
-    
-        We only receive updated client weights (not raw gradients), so we approximate
-        server gradient direction using parameter deltas:
-            delta_k = w_k - w_global
-            w_next = w_global + lr_server * sum_k(p_k * delta_k)
-    
-    Args:
-        client_params_list: List of updated parameter lists from K clients
-        global_params: Current global parameters
-        learning_rate: Server-side learning rate
-        client_sample_counts: Number of samples each client trained on
-    
-    Returns:
-        Updated global parameters
-    """
-    if not client_params_list:
-        raise ValueError("No clients to aggregate")
-    
-    num_clients = len(client_params_list)
-    total_samples = sum(client_sample_counts)
-    
-    # Start from current global parameters and apply weighted delta step.
-    aggregated = [np.copy(param) for param in global_params]
-    
-    for client_idx, client_params in enumerate(client_params_list):
-        weight = client_sample_counts[client_idx] / total_samples
-        
-        for i, (client_param, global_param) in enumerate(
-            zip(client_params, global_params)
-        ):
-            # Move toward client updates (do not invert update direction).
-            update = client_param - global_param
-            aggregated[i] += (weight * learning_rate * update)
-    
-    logger.debug(f"FedSGD: aggregated {num_clients} clients with lr={learning_rate}")
-    return aggregated
+    cosine_sim = np.dot(g_i, g_j) / (norm_i * norm_j)
+    return 1.0 - cosine_sim
 
 
 def aggregate_adaptive(
@@ -140,73 +25,80 @@ def aggregate_adaptive(
     global_params: List[np.ndarray],
     tau: float,
     learning_rate: float,
-    client_sample_counts: List[int],
+    gamma: float = 1.0,  # Tham số gamma trong công thức (7)
 ) -> Tuple[List[np.ndarray], str, float]:
     """
-    Adaptive aggregation: choose FedAvg or FedSGD based on divergence threshold.
-    
-    Per paper:
-    - If δ_t > τ: Use FedSGD (clients are diverging, need more aggressive update)
-    - If δ_t ≤ τ: Use FedAvg (clients converging nicely, just average)
-    
-    Args:
-        client_params_list: List of client parameter updates
-        global_params: Current global parameters
-        tau: Divergence threshold for switching
-        learning_rate: Learning rate for FedSGD if used
-        client_sample_counts: Number of samples each client trained on
-    
-    Returns:
-        Tuple of (aggregated_params, algorithm_used, divergence_metric)
+    Hàm gộp thích ứng chuẩn hóa theo bài báo:
+    1. Xấp xỉ Gradient updates từ Parameter Deltas.
+    2. Tính ma trận phân kì giữa các Client bằng Cosine Similarity.
+    3. Tính trọng số alpha_i theo công thức tương tác cặp (hoặc so với trung bình hệ thống).
+    4. Chuyển đổi linh hoạt giữa FedAvg và FedSGD dựa trên ngưỡng tau.
     """
-    # Compute divergence
-    divergence = compute_divergence(client_params_list, global_params)
+    if not client_params_list:
+        raise ValueError("No clients to aggregate")
+
+    num_clients = len(client_params_list)
     
-    # Choose algorithm based on threshold
-    if divergence > tau:
-        aggregated = aggregate_fedsgd(
-            client_params_list, global_params, learning_rate, client_sample_counts
-        )
+    # Bước 1: Xấp xỉ Gradients (G_i = W_global - W_client) cho từng client
+    client_gradients_flat = []
+    for client_params in client_params_list:
+        g_parts = []
+        for c_p, g_p in zip(client_params, global_params):
+            g_parts.append((g_p - c_p).flatten()) # Gradient update hướng về phía client học
+        client_gradients_flat.append(np.concatenate(g_parts))
+        
+    # Bước 2: Tính toán độ phân kì trung bình của hệ thống (Divergence Metric)
+    # Ta tính toán độ phân kì trung bình giữa các cặp client liên tiếp để đại diện cho Delta(G_i, G_j)
+    divergences = []
+    for i in range(num_clients):
+        for j in range(i + 1, num_clients):
+            div_ij = compute_cosine_divergence(client_gradients_flat[i], client_gradients_flat[j])
+            divergences.append(div_ij)
+            
+    # Độ phân kì đại diện cho vòng này (Lấy trung bình các cặp)
+    current_round_divergence = np.mean(divergences) if divergences else 0.0
+
+    # Bước 3: Tính toán Trọng số Thích ứng alpha_i cho từng Client dựa trên Công thức (7)
+    # Ở đây bài báo so sánh cặp (G_i, G_j), để tổng quát hóa cho hệ thống, ta tính độ lệch của G_i so với G_trung_bình
+    avg_gradient = np.mean(client_gradients_flat, axis=0)
+    alpha_list = []
+    for idx in range(num_clients):
+        div_i_to_avg = compute_cosine_divergence(client_gradients_flat[idx], avg_gradient)
+        # Công thức (7)
+        alpha_i = 1.0 / (1.0 + np.exp(-gamma * div_i_to_avg))
+        alpha_list.append(alpha_i)
+        
+    # Chuẩn hóa lại tổng alpha về 1 để không làm lệch scale của mô hình
+    total_alpha = sum(alpha_list)
+    normalized_weights = [alpha / total_alpha for alpha in alpha_list]
+
+    # Bước 4: Logic chuyển đổi chiến lược gộp dựa trên ngưỡng tau
+    aggregated = [np.copy(param) for param in global_params]
+
+    if current_round_divergence >= tau:
+        # Tình huống: Các máy phân kì cao (Divergence >= tau) -> Dùng FedSGD để ổn định (Stability)
         algorithm = "FedSGD"
-        logger.info(
-            f"Adaptive aggregation: divergence={divergence:.6f} > τ={tau}, using {algorithm}"
-        )
+        for client_idx, client_params in enumerate(client_params_list):
+            w_i = normalized_weights[client_idx]
+            for i, (client_param, global_param) in enumerate(zip(client_params, global_params)):
+                gradient_approx = global_param - client_param
+                # Cập nhật dạng FedSGD: W_new = W_old - lr * tổng(alpha * Gradient)
+                aggregated[i] -= (w_i * learning_rate * gradient_approx)
     else:
-        aggregated = aggregete_fedavg(client_params_list, client_sample_counts)
+        # Tình huống: Các máy đồng thuận tốt (Divergence < tau) -> Dùng FedAvg để giảm phương sai (Variance)
         algorithm = "FedAvg"
-        logger.info(
-            f"Adaptive aggregation: divergence={divergence:.6f} ≤ τ={tau}, using {algorithm}"
-        )
-    
-    return aggregated, algorithm, divergence
+        # Khởi tạo ma trận gộp bằng 0
+        for i in range(len(aggregated)):
+            aggregated[i] = np.zeros_like(aggregated[i])
+            
+        for client_idx, client_params in enumerate(client_params_list):
+            w_i = normalized_weights[client_idx]
+            for i, param in enumerate(client_params):
+                aggregated[i] += param * w_i
 
-
-if __name__ == "__main__":
-    # Test aggregation functions
-    # Simulate 3 clients with some parameters
+    logger.info(
+        f"Adaptive Aggregation: div={current_round_divergence:.4f} "
+        f"{'>=' if current_round_divergence >= tau else '<'} τ={tau} -> Sử dụng {algorithm}"
+    )
     
-    num_params = 100
-    num_clients = 3
-    
-    global_params = [np.random.randn(10, 10) for _ in range(num_params // 10)]
-    client_params = [
-        [np.random.randn(10, 10) + 0.1 * np.random.randn(10, 10) for _ in range(num_params // 10)]
-        for _ in range(num_clients)
-    ]
-    sample_counts = [100, 120, 150]
-    
-    # Test divergence
-    div = compute_divergence(client_params, global_params)
-    print(f"Divergence: {div:.6f}")
-    
-    # Test FedAvg
-    aggregated_avg = aggregete_fedavg(client_params, sample_counts)
-    print(f"FedAvg aggregation complete, num_params={len(aggregated_avg)}")
-    
-    # Test FedSGD
-    aggregated_sgd = aggregate_fedsgd(client_params, global_params, lr=0.01, client_sample_counts=sample_counts)
-    print(f"FedSGD aggregation complete, num_params={len(aggregated_sgd)}")
-    
-    # Test adaptive
-    agg, algo, div = aggregate_adaptive(client_params, global_params, tau=0.1, learning_rate=0.01, client_sample_counts=sample_counts)
-    print(f"Adaptive aggregation: algorithm={algo}, divergence={div:.6f}")
+    return aggregated, algorithm, float(current_round_divergence)
