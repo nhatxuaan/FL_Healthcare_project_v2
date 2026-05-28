@@ -18,7 +18,7 @@ from flwr.server.client_manager import ClientManager
 from flwr.server.client_proxy import ClientProxy
 
 # Import các hàm gộp thích ứng từ file aggregators của bạn
-from src.aggregators import aggregate_adaptive, compute_cosine_divergence
+# from src.aggregators import aggregate_adaptive, compute_cosine_divergence
 
 logger = logging.getLogger(__name__)
 
