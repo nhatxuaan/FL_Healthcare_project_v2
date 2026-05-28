@@ -11,6 +11,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+from sklearn.metrics import classification_report
 
 logger = logging.getLogger(__name__)
 
@@ -198,6 +199,8 @@ def print_metrics_summary(
     
     print("=" * 60 + "\n")
 
+    
+
 
 if __name__ == "__main__":
     # Test logging
@@ -219,3 +222,44 @@ if __name__ == "__main__":
     
     logger_obj.save_to_csv()
     print(f"Logged metrics to {logger_obj.metrics_file}")
+
+def evaluate_model_detailed(model, dataloader, device):
+    """
+    Đánh giá mô hình chi tiết, tính toán Accuracy, Recall, F1-score cho từng lớp (Normal vs TB).
+    """
+    model.eval()
+    total_loss = 0.0
+    all_preds = []
+    all_labels = []
+    criterion = torch.nn.CrossEntropyLoss()
+
+    with torch.no_grad():
+        for inputs, labels in dataloader:
+            inputs, labels = inputs.to(device), labels.to(device)
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+            total_loss += loss.item() * inputs.size(0)
+            
+            _, preds = torch.max(outputs, 1)
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(labels.cpu().numpy())
+
+    avg_loss = total_loss / len(dataloader.dataset)
+    
+    # Tính toán báo cáo chi tiết (0: Normal, 1: TB)
+    report = classification_report(
+        all_labels, 
+        all_preds, 
+        target_names=["Normal", "TB"], 
+        output_dict=True,
+        zero_division=0
+    )
+    
+    # In báo cáo tường minh dạng bảng đẹp mắt ra màn hình Console
+    print("\n" + "="*50)
+    print("DETAILED CLASSIFICATION REPORT (TEST SET)")
+    print("="*50)
+    print(classification_report(all_labels, all_preds, target_names=["Normal", "TB"], zero_division=0))
+    print("="*50)
+    
+    return avg_loss, report
