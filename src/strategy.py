@@ -139,11 +139,10 @@ class AdaptiveAggregationStrategy(Strategy):
             # Initialize with first client params
             self.global_params = client_weights[0]
         
-        # compute_cosine_divergence
-        divergence =compute_cosine_divergence(client_weights, self.global_params)
-        self.divergence_history.append(divergence)
-        
-        # Aggregate with adaptive strategy
+        # ----------------------------------------------------------------------
+        # SỬA LỖI TẠI ĐÂY: Loại bỏ dòng compute_cosine_divergence cũ gây lỗi shape.
+        # Thay vào đó, gọi trực tiếp aggregate_adaptive, lấy giá trị 'div' được tính toán chuẩn xác bên trong.
+        # ----------------------------------------------------------------------
         aggregated, algorithm_used, div = aggregate_adaptive(
             client_weights,
             self.global_params,
@@ -151,6 +150,10 @@ class AdaptiveAggregationStrategy(Strategy):
             learning_rate=self.learning_rate,
             client_sample_counts=sample_counts,
         )
+        
+        # Lưu divergence thu được từ hàm gộp vào lịch sử hệ thống
+        divergence = div
+        self.divergence_history.append(divergence)
         
         self.global_params = aggregated
         self.algorithm_history.append(algorithm_used)
