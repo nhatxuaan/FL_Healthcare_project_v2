@@ -181,284 +181,114 @@ class FlowerClient(fl.client.NumPyClient):
     # Feature-space SMOTE + fine-tune layer3+layer4+FC  (FIXED)
     # ------------------------------------------------------------------
 
-    def _fit_feature_smote(self, num_epochs: int) -> Tuple[float, int]:
-        """
-        Training path for ResNet-style models:
+   # client.py — _fit_feature_smote() viết lại, bỏ _PartialResNet
 
-        1. Freeze conv1+bn1+layer1+layer2, extract features with no_grad.
-        2. Apply SMOTE in 2048-d feature space (no pixel interpolation).
-        3. Build a TensorDataset from the SMOTE-balanced features.
-        4. Fine-tune layer3 + layer4 + FC head on that balanced set.
-           Weight_decay is applied to all fine-tuned parameters.
-        5. Optionally wrap with Opacus DP (same scope: layer3+layer4+fc).
+def _fit_feature_smote(self, num_epochs: int) -> Tuple[float, int]:
+    self.last_privacy_metrics = {}
+    base_model = self.model._module if hasattr(self.model, "_module") else self.model
 
-        Why fine-tune layer3+layer4 instead of only FC?
-        - With a frozen backbone the 2048-d space is perfectly linearly
-          separable for ImageNet-like images. SMOTE generates synthetic points
-          that lie on the same linear boundary → FC memorises it trivially.
-        - Allowing layer3/4 to update forces the network to learn TB-specific
-          high-level features, which generalises across clients and rounds.
-        """
-        self.last_privacy_metrics = {}
+    if not hasattr(base_model, "fc"):
+        logger.warning(f"Client {self.client_id}: không phải ResNet, fallback standard.")
+        return self._fit_standard(num_epochs)
 
-        base_model = self.model._module if hasattr(self.model, "_module") else self.model
+    # ── Step 1: extract 2048-d features (sau avgpool) để SMOTE ──────────
+    self.model.eval()
+    feat_list, label_list = [], []
+    with torch.no_grad():
+        for bx, by in self.train_dataloader:
+            feats = self._extract_resnet_features(bx.to(self.device))  # (B,2048)
+            feat_list.append(feats.cpu().numpy())
+            label_list.append(by.numpy())
 
-        if not hasattr(base_model, "fc"):
-            logger.warning(
-                f"Client {self.client_id}: feature-SMOTE only for ResNet-style models; "
-                f"falling back to standard training."
-            )
-            return self._fit_standard(num_epochs)
+    if not feat_list:
+        logger.warning(f"Client {self.client_id}: dataset rỗng.")
+        return 0.0, 0
 
-        # ----------------------------------------------------------
-        # Step 1: freeze low-level layers, extract features
-        # ----------------------------------------------------------
-        _low_level = [base_model.conv1, base_model.bn1,
-                      base_model.layer1, base_model.layer2]
-        for module in _low_level:
-            for p in module.parameters():
-                p.requires_grad = False
+    X = np.concatenate(feat_list)
+    y = np.concatenate(label_list)
+    logger.info(f"Client {self.client_id} — before SMOTE: {np.bincount(y, minlength=2)}")
 
-        _trainable = [base_model.layer3, base_model.layer4, base_model.fc]
-        for module in _trainable:
-            for p in module.parameters():
-                p.requires_grad = True
+    # ── Step 2: SMOTE trong 2048-d feature space ─────────────────────────
+    try:
+        k = max(1, min(5, int(np.sum(y == 1)) - 1))
+        X_res, y_res = SMOTE(random_state=42, k_neighbors=k).fit_resample(X, y)
+        logger.info(f"Client {self.client_id} — after SMOTE: {np.bincount(y_res, minlength=2)}")
+    except Exception as e:
+        logger.warning(f"Client {self.client_id}: SMOTE skipped ({e})")
+        X_res, y_res = X, y
 
-        self.model.eval()
-        feature_batches: List[np.ndarray] = []
-        label_batches:   List[np.ndarray] = []
+    # ── Step 3: Build DataLoader từ SMOTE features ───────────────────────
+    # Lưu ý: đây là 2048-d vectors, KHÔNG phải ảnh.
+    # Ta chỉ train FC head trên đây — nhưng lần này có Dropout + weight_decay.
+    smote_ds     = TensorDataset(
+        torch.tensor(X_res, dtype=torch.float32),
+        torch.tensor(y_res, dtype=torch.long),
+    )
+    smote_loader = DataLoader(smote_ds, batch_size=max(8, config.BATCH_SIZE), shuffle=True)
 
-        with torch.no_grad():
-            for batch_x, batch_y in self.train_dataloader:
-                feats = self._extract_resnet_features(batch_x.to(self.device))
-                feature_batches.append(feats.cpu().numpy())
-                label_batches.append(batch_y.numpy())
+    # ── Step 4: chỉ train FC head (đã có Dropout bên trong từ models.py) ─
+    # Backbone layer3+layer4 giữ frozen ở bước này vì input là features đã extract sẵn.
+    # weight_decay là regularisation chính để tránh overfit.
+    fc_head = base_model.fc.to(self.device)
+    fc_head.train()
 
-        if not feature_batches:
-            logger.warning(f"Client {self.client_id}: empty local dataset, skipping fit")
-            return 0.0, 0
+    optimizer = optim.SGD(
+        fc_head.parameters(),
+        lr=self.learning_rate,
+        momentum=0.9,
+        weight_decay=self.weight_decay,   # L2 regularisation
+    )
 
-        X_feats  = np.concatenate(feature_batches, axis=0)
-        y_labels = np.concatenate(label_batches, axis=0)
-        logger.info(
-            f"Client {self.client_id} — before SMOTE: {np.bincount(y_labels, minlength=2)}"
-        )
-
-        # ----------------------------------------------------------
-        # Step 2: SMOTE in feature space
-        # ----------------------------------------------------------
+    # ── Step 5: DP wrapping nếu cần ──────────────────────────────────────
+    train_loader   = smote_loader
+    privacy_engine = None
+    if self.dp_enabled:
         try:
-            n_minority = int(np.sum(y_labels == 1))
-            k_neighbors = max(1, min(5, n_minority - 1))
-            smote = SMOTE(random_state=42, k_neighbors=k_neighbors)
-            X_resampled, y_resampled = smote.fit_resample(X_feats, y_labels)
-            logger.info(
-                f"Client {self.client_id} — after SMOTE: "
-                f"{np.bincount(y_resampled, minlength=2)}"
+            privacy_engine = PrivacyEngine()
+            fc_head, optimizer, train_loader = privacy_engine.make_private(
+                module=fc_head,
+                optimizer=optimizer,
+                data_loader=smote_loader,
+                noise_multiplier=config.DP_NOISE_MULTIPLIER,
+                max_grad_norm=config.DP_MAX_GRAD_NORM,
             )
         except Exception as e:
-            logger.warning(
-                f"Client {self.client_id}: SMOTE skipped ({e}); "
-                f"using original data."
-            )
-            X_resampled, y_resampled = X_feats, y_labels
+            logger.warning(f"Client {self.client_id}: DP failed ({e}), bỏ qua DP.")
+            privacy_engine = None
+            train_loader   = smote_loader
 
-        # ----------------------------------------------------------
-        # Step 3: Build balanced DataLoader (features → device in loop)
-        # ----------------------------------------------------------
-        smote_dataset = TensorDataset(
-            torch.tensor(X_resampled, dtype=torch.float32),
-            torch.tensor(y_resampled, dtype=torch.long),
-        )
-        smote_loader = DataLoader(
-            smote_dataset,
-            batch_size=max(8, config.BATCH_SIZE),
-            shuffle=True,
-        )
+    # ── Step 6: training loop ─────────────────────────────────────────────
+    total_loss = 0.0
+    for epoch in range(num_epochs):
+        ep_loss, ep_seen = 0.0, 0
+        for bx, by in train_loader:
+            bx, by = bx.to(self.device), by.to(self.device)
+            optimizer.zero_grad()
+            loss = self.loss_fn(fc_head(bx), by)
+            loss.backward()
+            optimizer.step()
+            ep_loss += loss.item() * by.size(0)
+            ep_seen += by.size(0)
+        ep_loss /= max(ep_seen, 1)
+        total_loss += ep_loss
+        logger.info(f"Client {self.client_id} epoch {epoch+1}/{num_epochs}: loss={ep_loss:.4f}")
 
-        # ----------------------------------------------------------
-        # Step 4: collect trainable params (layer3 + layer4 + fc)
-        # ----------------------------------------------------------
-        # We need to pass only the trainable sub-modules to the optimiser
-        # (and to Opacus if DP is on).  Collect the modules directly.
-        trainable_modules = nn.ModuleList([
-            base_model.layer3,
-            base_model.layer4,
-            base_model.fc,
-        ])
+    # ── Step 7: copy weights về base model ───────────────────────────────
+    src = privacy_engine.module if privacy_engine else fc_head
+    if hasattr(src, "_module"):
+        src = src._module
+    base_model.fc.load_state_dict(src.state_dict(), strict=False)
 
-        # ----------------------------------------------------------
-        # Step 5: define a forward function that uses layer3+layer4+fc
-        #         on the 2048-d pre-pooled features coming from SMOTE
-        # ----------------------------------------------------------
-        # Because we extracted features BEFORE layer3 (i.e. after layer2+avgpool
-        # — wait, let's be precise: _extract_resnet_features goes through layer4
-        # and avgpool, yielding 2048-d).
-        #
-        # That means X_resampled is ALREADY past layer3/layer4.  We can only
-        # fine-tune the FC head from SMOTE features in this setup.  To fine-tune
-        # layer3+layer4 we need features extracted from layer2 output instead.
-        #
-        # REVISED extraction: stop at layer2 output (256-d spatial maps),
-        # let SMOTE work in that space (still much smaller than pixel-space),
-        # then forward through layer3→layer4→avgpool→fc during training.
-
-        # Re-extract features at layer2 output (more expensive but correct)
-        feature_batches_l2: List[np.ndarray] = []
-        label_batches_l2:   List[np.ndarray] = []
-
-        self.model.eval()
-        with torch.no_grad():
-            for batch_x, batch_y in self.train_dataloader:
-                bx = batch_x.to(self.device)
-                bx = base_model.conv1(bx)
-                bx = base_model.bn1(bx)
-                bx = base_model.relu(bx)
-                bx = base_model.maxpool(bx)
-                bx = base_model.layer1(bx)
-                bx = base_model.layer2(bx)
-                # Global average pool to get a flat vector for SMOTE
-                bx = bx.mean(dim=[2, 3])   # (B, 512)
-                feature_batches_l2.append(bx.cpu().numpy())
-                label_batches_l2.append(batch_y.numpy())
-
-        X_l2 = np.concatenate(feature_batches_l2, axis=0)
-        y_l2 = np.concatenate(label_batches_l2, axis=0)
-
+    # Privacy budget
+    if privacy_engine:
         try:
-            n_minority_l2 = int(np.sum(y_l2 == 1))
-            k_l2 = max(1, min(5, n_minority_l2 - 1))
-            smote_l2 = SMOTE(random_state=42, k_neighbors=k_l2)
-            X_l2_res, y_l2_res = smote_l2.fit_resample(X_l2, y_l2)
-            logger.info(
-                f"Client {self.client_id} — layer2 SMOTE: "
-                f"{np.bincount(y_l2_res, minlength=2)}"
-            )
-        except Exception as e:
-            logger.warning(f"Client {self.client_id}: layer2 SMOTE skipped ({e})")
-            X_l2_res, y_l2_res = X_l2, y_l2
+            eps = float(privacy_engine.accountant.get_epsilon(delta=1e-5))
+            self.last_privacy_metrics = {"epsilon": eps, "delta": 1e-5}
+        except Exception:
+            pass
 
-        # Build DataLoader from layer2 features
-        l2_dataset = TensorDataset(
-            torch.tensor(X_l2_res, dtype=torch.float32),  # (N, 512)
-            torch.tensor(y_l2_res, dtype=torch.long),
-        )
-        l2_loader = DataLoader(
-            l2_dataset,
-            batch_size=max(8, config.BATCH_SIZE),
-            shuffle=True,
-        )
-
-        # ----------------------------------------------------------
-        # Step 6: define the partial forward pass (layer3→layer4→fc)
-        # ----------------------------------------------------------
-        class _PartialResNet(nn.Module):
-            """Wraps layer3+layer4+avgpool+fc for fine-tuning on l2 features."""
-            def __init__(self, resnet_base):
-                super().__init__()
-                self.layer3 = resnet_base.layer3
-                self.layer4 = resnet_base.layer4
-                self.avgpool = resnet_base.avgpool
-                self.fc     = resnet_base.fc
-
-            def forward(self, x):
-                # x: (B, 512) flat — reshape to (B, 512, 1, 1) for layer3
-                x = x.unsqueeze(-1).unsqueeze(-1)
-                x = self.layer3(x)
-                x = self.layer4(x)
-                x = self.avgpool(x)
-                x = torch.flatten(x, 1)
-                return self.fc(x)
-
-        partial_net = _PartialResNet(base_model).to(self.device)
-        partial_net.train()
-
-        optimizer = optim.SGD(
-            partial_net.parameters(),
-            lr=self.learning_rate,
-            momentum=0.9,
-            weight_decay=self.weight_decay,   # L2 regularisation — key fix
-        )
-
-        # ----------------------------------------------------------
-        # Step 7: optional DP wrapping on partial_net
-        # ----------------------------------------------------------
-        train_loader  = l2_loader
-        privacy_engine = None
-        if self.dp_enabled and len(l2_dataset) > 0:
-            try:
-                privacy_engine = PrivacyEngine()
-                partial_net, optimizer, train_loader = privacy_engine.make_private(
-                    module=partial_net,
-                    optimizer=optimizer,
-                    data_loader=l2_loader,
-                    noise_multiplier=config.DP_NOISE_MULTIPLIER,
-                    max_grad_norm=config.DP_MAX_GRAD_NORM,
-                )
-            except Exception as e:
-                logger.warning(
-                    f"Client {self.client_id}: DP wrap failed ({e}); "
-                    f"continuing without DP."
-                )
-                privacy_engine = None
-                train_loader   = l2_loader
-
-        # ----------------------------------------------------------
-        # Step 8: training loop
-        # ----------------------------------------------------------
-        total_loss  = 0.0
-        num_samples = len(l2_dataset)
-
-        for epoch in range(num_epochs):
-            epoch_loss = 0.0
-            epoch_seen = 0
-
-            for batch_x, batch_y in train_loader:
-                batch_x = batch_x.to(self.device)
-                batch_y = batch_y.to(self.device)
-
-                optimizer.zero_grad()
-                logits = partial_net(batch_x)
-                loss   = self.loss_fn(logits, batch_y)
-                loss.backward()
-                optimizer.step()
-
-                epoch_loss += loss.item() * batch_y.size(0)
-                epoch_seen += batch_y.size(0)
-
-            epoch_loss /= max(epoch_seen, 1)
-            total_loss += epoch_loss
-            logger.info(
-                f"Client {self.client_id}, Epoch {epoch+1}/{num_epochs} "
-                f"(feature-SMOTE layer2→fc): loss={epoch_loss:.4f}"
-            )
-
-        # ----------------------------------------------------------
-        # Step 9: copy fine-tuned weights back to base model
-        # ----------------------------------------------------------
-        # Unwrap DP module if present
-        src_net = privacy_engine.module if privacy_engine is not None else partial_net
-        # src_net may be wrapped in _DP module; strip prefix
-        if hasattr(src_net, "_module"):
-            src_net = src_net._module
-
-        for attr in ["layer3", "layer4", "fc"]:
-            getattr(base_model, attr).load_state_dict(
-                getattr(src_net, attr).state_dict(), strict=True
-            )
-
-        # Record privacy budget
-        if privacy_engine is not None:
-            delta = 1e-5
-            try:
-                epsilon = float(privacy_engine.accountant.get_epsilon(delta=delta))
-                self.last_privacy_metrics = {"epsilon": epsilon, "delta": delta}
-            except Exception as e:
-                logger.warning(f"Client {self.client_id}: failed to compute epsilon: {e}")
-
-        self.model.train()
-        avg_loss = total_loss / max(num_epochs, 1)
-        return avg_loss, int(num_samples)
+    self.model.train()
+    return total_loss / max(num_epochs, 1), len(smote_ds)
 
     # ------------------------------------------------------------------
     # Evaluation
